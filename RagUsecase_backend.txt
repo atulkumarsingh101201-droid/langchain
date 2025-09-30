@@ -1,0 +1,506 @@
+RagUsecase/
+├── backend/
+│   ├── requirements.txt
+│   ├── .env
+│   ├── app/
+│   │   ├── auth.py
+│   │   ├── config.py
+│   │   ├── db.py
+│   │   ├── main.py
+│   │   ├── vectorstore.py
+│   │   └── __pycache__/
+│   │       ├── auth.cpython-313.pyc
+│   │       ├── config.cpython-313.pyc
+│   │       ├── db.cpython-313.pyc
+│   │       ├── main.cpython-313.pyc
+│   │       └── vectorstore.cpython-313.pyc
+│   ├── repos/
+│   │   ├── loaders.py
+│   │   ├── rag_pipe.py
+│   │   └── __pycache__/
+│   │       ├── loaders.cpython-313.pyc
+│   │       └── rag_pipe.cpython-313.pyc
+│   └── routes/
+│       ├── auth_route.py
+│       ├── loaders_route.py
+│       ├── rag_route.py
+│       └── __pycache__/
+│           ├── auth_route.cpython-313.pyc
+│           ├── loaders_route.cpython-313.pyc
+│           └── rag_route.cpython-313.pyc
+└── frontend/
+
+
+-------------------------------------------------------------------------
+------------------requirments.txt---------------
+empty
+
+------------------.env file---------------------
+MONGODB_URI="mongodb+srv://atul_mongo_db:Atul%406248@cluster0.j3voz2j.mongodb.net/rag_db?retryWrites=true&w=majority"
+MONGODB_DB="rag_db"
+MONGODB_COLLECTION="rag_collection"
+MONGODB_VECTOR_INDEX="vector_index"
+
+JWT_SECRET="change_this_secret"
+JWY_ALGORITHM="HS256"
+JWT_EXPIRES_SECONDS=3600
+
+AZURE_OPENAI_API_KEY="324d65fb09fe437ca13081e430aaf220"
+AZURE_OPENAI_API_BASE="https://ccamumgenai.openai.azure.com/"
+AZURE_OPENAI_CHAT_DEPLOYMENT="cca-genai-gpt4o"
+AZURE_OPENAI_EMBEDDING_DEPLOYMENT="cca-genai-text-embedding-3-small"
+AZURE_OPENAI_API_VERSION="2024-10-21"
+
+------------------auth.py-----------------------
+import os 
+from datetime import datetime, timedelta
+from passlib.context import CryptContext
+import jwt
+from fastapi import HTTPException, status, Depends
+from pydantic import BaseModel, EmailStr
+from app.db import userscollection
+from dotenv import load_dotenv
+
+load_dotenv()
+
+JWT_SECRET = os.getenv("JWT_SECRET")
+JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
+JWT_EXPIRE_SECONDS = int(os.getenv("JWT_EXPIRE_SECONDS", 3600))
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+class User(BaseModel):
+    email: EmailStr
+    password: str
+    full_name: str | None = None
+
+async def get_user_by_email(email: str):
+    #user = userscollection.find_one({"email": email})
+    #if user:
+    #    return User(**user)
+    #return None
+    return await userscollection.find_one({"email": email})
+
+async def create_user(user: User):
+    existing = await userscollection.find_one({"email": user.email})
+    if existing:
+        raise HTTPException(status_code=400, detail="Email already registered")
+    hashed_password = pwd_context.hash(user.password[:72])
+
+    user_doc ={
+        "email": user.email,
+        "password_hash": hashed_password,
+        "fullname": user.full_name,
+        "created_at": datetime.utcnow(),
+    }
+    result = await userscollection.insert_one(user_doc)
+    user_doc["id"] = str(result.inserted_id)
+    return user_doc
+
+def create_access_token(subject: str):
+    expire = datetime.utcnow() + timedelta(seconds=JWT_EXPIRE_SECONDS)
+    to_encode = {"exp": expire, "sub": str(subject)}
+    encoded_jwt = jwt.encode(to_encode, JWT_SECRET, algorithm=JWT_ALGORITHM)
+    return encoded_jwt
+
+def verify_password(plain_password, hashed_password):
+    return pwd_context.verify(plain_password[:72], hashed_password)
+
+async def authenticate_user(email: str,passord: str):
+    user = await get_user_by_email(email)
+    if not user or not verify_password(passord, user["password_hash"]):
+        return None
+    return user
+
+-----------------------config.py--------------
+import os
+from dotenv import load_dotenv
+from langchain_openai import AzureChatOpenAI, AzureOpenAIEmbeddings
+
+load_dotenv()
+
+AZURE_API_KEY = os.getenv("AZURE_OPENAI_API_KEY")
+AZURE_API_BASE = os.getenv("AZURE_OPENAI_API_BASE")
+AZURE_CAHT_DEPLOYMENT = os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT")
+AZURE_EMB_DEPLOYMENT = os.getenv("AZURE_OPENAI_EMBEDDING_DEPLOYMENT")
+AZURE_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2024-10-21")
+
+# Azure OpenAI Configuration
+llm = AzureChatOpenAI(
+    api_version=AZURE_API_VERSION,
+    azure_endpoint=AZURE_API_BASE,
+    api_key=AZURE_API_KEY,
+    azure_deployment=AZURE_CAHT_DEPLOYMENT,
+    temperature=0.0,
+    max_tokens=512,
+)
+
+embeddings = AzureOpenAIEmbeddings(
+    azure_deployment=AZURE_EMB_DEPLOYMENT,
+    azure_endpoint=AZURE_API_BASE,
+    api_key=AZURE_API_KEY,
+    api_version=AZURE_API_VERSION,
+    model="text-embedding-3-small",
+)
+
+-------------------db.py-------------------------
+#async
+import os
+from motor.motor_asyncio import AsyncIOMotorClient
+from dotenv import load_dotenv
+
+load_dotenv()
+
+MONGODB_URI = os.getenv("MONGODB_URI")
+DB_NAME = os.getenv("MONGODB_DB")
+
+if not MONGODB_URI :
+    raise ValueError("MONGODB_URI not found in environment variables")
+
+client = AsyncIOMotorClient(MONGODB_URI)
+db = client[DB_NAME]
+
+userscollection = db["users"]
+documentscollection = db["documents"]
+conversationcollection = db["conversations"]
+
+--------------------main.py--------------------
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+
+app = FastAPI(title="RAGUSECASE Backend (dev)")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.get("/")
+async def root():
+    return {"status": "ok", "msg":" Backend up "}
+
+from app.config import llm, embeddings
+
+@app.get("/health/azure")
+async def health_azure():
+    try:
+        response = llm.invoke("Hello from Azure OpenAI!")
+        return {"ok": True, "response": response.content}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+    
+from app.vectorstore import vectorstore
+from langchain_core.documents import Document
+
+@app.get("/test/ingest")
+async def test_ingest():
+
+    #dummy docs
+    docs = [
+        Document(page_content="This is a test document.", metadata={"source": "intro"}),
+        Document(page_content="Another test document for ingestion.", metadata={"source": "intro"}),
+    ]
+
+    vectorstore.add_documents(docs)
+    return {"ok": True, "ingested_docs" :len(docs)}
+            
+@app.get("/test/query")
+async def test_query(q: str):
+    #query = "What is this?"
+    result = vectorstore.similarity_search(q, k=2)
+    return [{"content": d.page_content, "metadata": d.metadata} for d in result]
+
+from routes.auth_route import router as authrouter
+
+app.include_router(authrouter)
+
+from routes.loaders_route import router as loadersrouter
+
+app.include_router(loadersrouter)
+
+from routes.rag_route import router as rag_router
+
+app.include_router(rag_router)
+
+--------------------vectorstore.py---------------
+#syncr
+import os
+from dotenv import load_dotenv
+from pymongo import MongoClient
+from langchain_mongodb import MongoDBAtlasVectorSearch
+from app.config import embeddings
+
+load_dotenv()
+
+MONGODB_URI = os.getenv("MONGODB_URI")
+DB_NAME = os.getenv("MONGODB_DB")
+COLLECTION_NAME = os.getenv("MONGODB_COLLECTION")
+INDEX_NAME = os.getenv("MONGODB_VECTOR_INDEX")
+
+client = MongoClient(MONGODB_URI)
+db = client[DB_NAME]
+collection = db[COLLECTION_NAME]
+
+vectorstore = MongoDBAtlasVectorSearch(
+    collection=collection,
+    index_name=INDEX_NAME,
+    embedding=embeddings,
+    relevance_score_fn="cosine",
+)
+
+--------------------loaders.py------------------
+from app.config import embeddings
+from app.vectorstore import INDEX_NAME, collection
+from langchain_mongodb import MongoDBAtlasVectorSearch
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from itertools import islice
+
+def process_pdf(file_path, email: str, namespace: str, chunk_size: int =1000, chunk_overlap: int=200,split: bool=True):
+
+    def batch_iterable(iterable, batch_size):
+        iterator = iter(iterable)
+        for first in iterator:
+            yield [first] + list(islice(iterator,batch_size - 1))
+
+    loader = PyPDFLoader(file_path)
+    pages = loader.load()
+
+    for page in pages:
+        page.metadata["email"] = email
+        page.metadata["namespace"] = namespace
+
+    docs = pages
+    if split:
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap
+        )
+        docs = text_splitter.split_documents(pages)
+    batch_size= 15
+    for batch in batch_iterable(docs, batch_size):
+        MongoDBAtlasVectorSearch.from_documents(
+            documents=batch,
+            collection=collection,
+            index_name=INDEX_NAME,
+            embedding=embeddings,
+            relevance_score_fn="cosine",
+        )
+    return {"status": "success", "chunks": len(docs)}
+
+-------------------------rag_pipe.py-----------------
+from typing import List
+from app.config import embeddings, llm
+from app.vectorstore import INDEX_NAME,db, collection, client, vectorstore
+from langchain_mongodb import MongoDBAtlasVectorSearch
+from langchain_core.tools import tool
+from langchain_core.messages import SystemMessage
+from langchain_core.documents import Document
+from langgraph.prebuilt import ToolNode, tools_condition
+from langgraph.graph import MessagesState, StateGraph, END
+from langgraph.checkpoint.mongodb import AsyncMongoDBSaver
+
+class State(MessagesState):
+    context: List[Document]
+
+@tool(response_format="content_and_artifact")
+def retrieve(query: str):
+    """Retrieve information related to a query. Alway query the ask."""
+    retrieved_docs = vectorstore.similarity_search(query, k=4)
+    serialized = "\n\n".join(
+        (f"Source: {doc.metadata}\nContent: {doc.page_content}")
+        for doc in retrieved_docs
+    )
+    return serialized, retrieved_docs
+
+
+def query_or_respond(state: MessagesState):
+    """Generate tool call for retrieval or respond."""
+    llm_with_tools = llm.bind_tools([retrieve])
+    system_message_content = (
+        "You are an ai assistant for Wingstop Organization and your work is question-answering tasks. "
+        "Your name is 'Saucey'. "
+        "Use the provided tool for retrieval from knowledge base."
+        "Don't answer out of the knowledge base and if you don't know simply say that provided documents don't have the info."
+        "You must use the retrieve tool whever user queries. You should never answer from general knowledge that isn't grounded in search results"
+        "\n\n")
+    conversation_messages = [
+        message
+        for message in state["messages"]
+        if message.type in ("human", "system")
+        or (message.type == "ai" and not message.tool_calls)
+    ]
+    prompt = [SystemMessage(system_message_content)] + conversation_messages
+    response = llm_with_tools.invoke(prompt)
+    
+    return {"messages": [response]}
+
+tools = ToolNode([retrieve])
+
+def generate(state: MessagesState):
+    """Generate answer."""
+    
+    recent_tool_messages = []
+    for message in reversed(state["messages"]):
+        if message.type == "tool":
+            recent_tool_messages.append(message)
+        else:
+            break
+    tool_messages = recent_tool_messages[::-1]
+
+    docs_content = "\n\n".join(doc.content for doc in tool_messages)
+    system_message_content = (
+        "You are an ai assistant for Wingstop and your work is question-answering tasks. "
+        "Your name is 'Saucey' and you are facing the internal employee's queries"
+        "Use the following pieces of retrieved context to answer "
+        "the question. If you don't know the answer, say that you "
+        "don't know. Use three sentences maximum and keep the "
+        "answer concise and explain those where needed."
+        "\n\n"
+        f"{docs_content}"
+    )
+    conversation_messages = [
+        message
+        for message in state["messages"]
+        if message.type in ("human", "system")
+        or (message.type == "ai" and not message.tool_calls)
+    ]
+    prompt = [SystemMessage(system_message_content)] + conversation_messages
+
+    # Run
+    response = llm.invoke(prompt)
+    context = []
+    for tool_message in tool_messages:
+        context.extend(tool_message.artifact)
+    return {"messages": [response], "context": context}
+
+graph_builder = StateGraph(MessagesState)
+graph_builder.add_node(query_or_respond)
+graph_builder.add_node(tools)
+graph_builder.add_node(generate)
+
+graph_builder.set_entry_point("query_or_respond")
+graph_builder.add_conditional_edges(
+    "query_or_respond",
+    tools_condition,
+    {END: END, "tools": "tools"},
+)
+graph_builder.add_edge("tools", "generate")
+graph_builder.add_edge("generate", END)
+
+async_memory = AsyncMongoDBSaver(
+    client= client,
+    db_name= "wingstop"
+)
+async_graph = graph_builder.compile(checkpointer=async_memory)
+
+-------------------auth_route.py-------------
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel, EmailStr
+from app.auth import create_user, authenticate_user, create_access_token
+
+router = APIRouter(prefix="/auth", tags=["auth"])
+
+class Register(BaseModel):
+    email: EmailStr
+    password: str
+    full_name: str | None = None
+
+class Login(BaseModel):
+    email: EmailStr
+    password: str
+
+@router.post("/register")
+async def register(payload: Register):
+    try:
+        user = await create_user(payload)
+        return {"id": str(user["id"]), "email": user["email"]}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@router.post("/login")
+async def login(payload: Login):
+    user = await authenticate_user(payload.email, payload.password)
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    token = create_access_token(str(user["_id"]))
+    return {"access_token": token, "token_type": "bearer"}
+
+----------------------loaders_route.py----------------
+import os
+import aiofiles
+import tempfile
+from fastapi import APIRouter, HTTPException, UploadFile, Form
+from repos.loaders import process_pdf
+
+router = APIRouter(prefix="/loaders", tags=["Document loaders"])
+
+@router.post("/upload-pdf")
+async def upload_pdf(
+    file: UploadFile,
+    email: str = Form(...),
+    namespace: str = Form(...),
+    chunk_size: int = Form(1000),
+    chunk_overlap: int = Form(200),
+    split: bool = Form(True),
+):
+    try:
+        suffix = os.path.splitext(file.filename)[1]
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp_path = tmp.name
+
+        async with aiofiles.open(tmp_path, "wb") as out:
+            content = await file.read()
+            await out.write(content)
+
+        result = process_pdf(tmp_path, email, namespace, chunk_size, chunk_overlap, split)
+        os.remove(tmp_path)
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    
+-----------------------rag_route.py---------------
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
+from repos.rag_pipe import async_graph
+
+router = APIRouter(prefix="/ai", tags=["AI"])
+
+class QuestionRequest(BaseModel):
+    question: str
+    thread_id: str
+    user_email: str
+
+
+@router.post("/ask")
+def ask(request: QuestionRequest):
+    question = request.question
+    thread_id = request.thread_id
+    email = request.user_email
+
+    config = {
+        "configurable": {
+            "thread_id": thread_id,
+            "user_email": email,
+        }
+    }
+
+    try:
+        response_events = []
+        for event in async_graph.stream(
+            {"messages": [{"user": question}]}, config, stream_mode="values"
+        ):
+            response_events.append(event)
+
+        if response_events and "messages" in response_events[-1]:
+            last_msg = response_events[-1]["messages"][-1]
+            return {"answer": last_msg.content}
+        else:
+            raise HTTPException(status_code=404, detail="No valid response received")
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+------------------------------------------------------------------------
